@@ -1,4 +1,4 @@
-name: RDP Auto Setup
+name: RDP
 
 on:
   workflow_dispatch:
@@ -6,59 +6,75 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
       - name: Set Execution Policy
         run: Set-ExecutionPolicy Bypass -Scope Process -Force
+
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # Allow RDP through firewall
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # Restart Remote Desktop Service
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          $username = "RDP"
+          # Generate secure random password
+          $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()'
+          $password = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create user and add to groups
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+          # Save credentials to environment for later steps
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           choco install tailscale -y
           refreshenv
 
-      - name: Configure Core RDP Settings
+      - name: Establish Tailscale Connection
         run: |
-          # Enable RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=$hostname --accept-routes
 
-          # Firewall rule
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User
-        run: |
-          $username = "RDP"
-          $password = [System.Web.Security.Membership]::GeneratePassword(16,4)
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member $username
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          # Wait for Tailscale IP
+          $tsIP = $null
+          for ($i=0; $i -lt 10; $i++) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
           }
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Start Tailscale
-        run: |
-          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $tsPath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname GitHubRDP --accept-routes
-          $tsIP = & $tsPath ip -4
+          if (-not $tsIP) { throw "Tailscale IP not assigned" }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Send RDP Info to Telegram
+      - name: Send Credentials to Telegram Bot
         run: |
+          $chatId = "1411957595"
           $botToken = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
-          $chatId = "${{ secrets.TELEGRAM_CHAT_ID }}"
-          $message = "✅ RDP Ready`nAddress: $env:TAILSCALE_IP`nUsername: RDP`nPassword: $env:RDP_PASSWORD"
-          Invoke-RestMethod -Uri "https://api.telegram.org/bot$botToken/sendMessage" -Method Post -Body @{chat_id=$chatId; text=$message}
+          $message = "✅ RDP Created`nIP: $env:TAILSCALE_IP`nUsername: $env:RDP_USER`nPassword: $env:RDP_PASS"
+          Invoke-RestMethod -Uri "https://api.telegram.org/bot$botToken/sendMessage" -Method POST -Body @{ chat_id=$chatId; text=$message }
 
-      - name: Keep Connection Alive
+      - name: Keep Connection Active
         run: |
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP active. Workflow will run until cancelled."
-            Start-Sleep -Seconds 300
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 300
           }
