@@ -1,109 +1,93 @@
-name: Secure Windows RDP with Tailscale
+name: Secure RDP
 
 on:
-  workflow_dispatch:  # يمكن تشغيله يدويًا
-  schedule:
-    - cron: '0 */6 * * *'  # يعيد التشغيل كل 6 ساعات
+  workflow_dispatch:
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      - name: Prepare Environment
-        run: |
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-
-      - name: Install Chocolatey (if not installed)
-        shell: powershell
-        run: |
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          }
+      - name: Set PowerShell Execution Policy
+        run: Set-ExecutionPolicy Bypass -Scope Process -Force
 
       - name: Install Tailscale
-        shell: powershell
-        run: |
-          choco install tailscale -y
-          refreshenv
+        run: choco install tailscale -y
 
-      - name: Configure Core RDP Settings
-        shell: powershell
+      - name: Configure RDP
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          # Disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          # Allow firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          # Restart RDP service
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
-        shell: powershell
+      - name: Create RDP User if Not Exists
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          try {
+              $user = Get-LocalUser -Name "RDP" -ErrorAction Stop
+              Write-Host "User RDP already exists"
+          } catch {
+              Write-Host "User RDP does not exist. Creating..."
+              Add-Type -AssemblyName System.Security
+              $charSet = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 4
+              $rawPassword += $charSet.Lower | Get-Random -Count 4
+              $rawPassword += $charSet.Number | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 4
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+              echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+              echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
       - name: Connect Tailscale
-        shell: powershell
         run: |
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $tsExe up --authkey ${{ secrets.TAILSCALE_KEY }} --hostname GitHubRDP --accept-routes
-
-      - name: Get Tailscale IP
-        shell: powershell
-        run: |
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $tsIP = & $tsExe ip -4
+          $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tailscalePath up --authkey ${{ secrets.TAILSCALE_AUTH_KEY }} --hostname GitHubRDP
+          # Get Tailscale IP
+          $tsIP = & $tailscalePath ip -4
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Verify RDP Connectivity
-        shell: powershell
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $test.TcpTestSucceeded) {
-              Write-Error "RDP TCP connection failed!"
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $result.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
+          } else {
+              Write-Host "TCP connectivity successful!"
           }
-          Write-Host "RDP TCP connectivity OK"
 
-      - name: Display Credentials
-        shell: powershell
+      - name: Display RDP Access
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "IP: $env:TAILSCALE_IP"
-          Write-Host "User: $env:RDP_USER"
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "==================`n"
-
-      - name: Keep Connection Alive
-        shell: powershell
-        run: |
+          Write-Host "================="
+          # Keep runner alive for manual connection (optional)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Workflow will renew automatically every 6 hours"
               Start-Sleep -Seconds 300
           }
