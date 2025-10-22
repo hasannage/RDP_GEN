@@ -8,7 +8,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 350   # مدة التشغيل لكل جلسة ~6 ساعات
+    timeout-minutes: 350   # مدة تشغيل ~6 ساعات
 
     steps:
     - name: إعداد البيئة
@@ -16,11 +16,12 @@ jobs:
         Set-ExecutionPolicy Bypass -Scope Process -Force
         echo "✅ البيئة جاهزة"
 
-    - name: تثبيت Tailscale
+    - name: تثبيت وتشغيل Tailscale
       run: |
         choco install tailscale -y
         Start-Sleep -Seconds 10
-        tailscale up --authkey ${{ secrets.TAILSCALE_KEY }} --hostname GitHubRDP --accept-routes
+        $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+        & $tsExe up --authkey ${{ secrets.TAILSCALE_KEY }} --hostname GitHubRDP --accept-routes
 
     - name: إنشاء مستخدم جديد
       run: |
@@ -74,7 +75,7 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GH_TOKEN }}
         REPO: ${{ github.repository }}
-        WORKFLOW_FILE: rdp.yml
+        WORKFLOW_FILE: rdp.yml   # <-- تأكد أن هذا هو اسم الملف الفعلي في المستودع
       run: |
         Start-Sleep -Seconds 5
         $uri = "https://api.github.com/repos/$env:REPO/actions/workflows/$env:WORKFLOW_FILE/dispatches"
