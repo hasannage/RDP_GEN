@@ -1,181 +1,92 @@
-name: RDP Auto-Renew (Tailscale + Telegram Notify)
+name: Windows RDP Auto-Renew
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # تشغيل كل 6 ساعات
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    # Set to 6 hours = 360 minutes (GitHub Free commonly enforces ~6h max).
-    timeout-minutes: 360
+    timeout-minutes: 350   # مدة التشغيل لكل جلسة ~6 ساعات
 
     steps:
-      - name: Configure Core RDP Settings
-        shell: pwsh
-        run: |
-          # Enable Remote Desktop & relax NLA/security layer for compatibility
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+    - name: إعداد البيئة
+      run: |
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        echo "✅ البيئة جاهزة"
 
-          # Remove duplicate firewall rule and add allow on 3389
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+    - name: تثبيت Tailscale
+      run: |
+        choco install tailscale -y
+        Start-Sleep -Seconds 10
+        tailscale up --authkey ${{ secrets.TAILSCALE_KEY }} --hostname GitHubRDP --accept-routes
 
-          Restart-Service -Name TermService -Force
+    - name: إنشاء مستخدم جديد
+      run: |
+        net user githubadmin Pass@123 /add
+        net localgroup administrators githubadmin /add
+        echo "✅ تم إنشاء المستخدم githubadmin"
 
-      - name: Create RDP User with Secure Password
-        shell: pwsh
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+    - name: تمكين RDP
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        echo "✅ تم تفعيل RDP"
 
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            # If user exists, reset password
-            $u = Get-LocalUser -Name "RDP"
-            $u | Set-LocalUser -Password $securePass
-          } else {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
-          }
+    - name: الحصول على IP
+      id: get_ip
+      shell: powershell
+      run: |
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -ne "Loopback Pseudo-Interface 1"} | Select-Object -First 1 -ExpandProperty IPAddress)
+        echo "ip_address=$ip" >> $env:GITHUB_OUTPUT
 
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+    - name: إرسال إشعار عبر Telegram
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        $msg = "🔔 *Windows RDP جاهز!*`n`n*IP:* `${{ steps.get_ip.outputs.ip_address }}``n*Username:* `githubadmin``n*Password:* `Pass@123``n⏱️ *التجديد التالي خلال 6 ساعات*"
+        $url = "https://api.telegram.org/bot$env:TELEGRAM_TOKEN/sendMessage"
+        $body = @{
+          chat_id = $env:TELEGRAM_CHAT_ID
+          text = $msg
+          parse_mode = "Markdown"
+        }
+        Invoke-RestMethod -Uri $url -Method POST -Body $body
 
-          # Export the generated password to ENV for later use (not persisted outside run)
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+    - name: إبقاء الاتصال (loop إعلامي)
+      shell: pwsh
+      run: |
+        Write-Host "`n=== RDP ACCESS ==="
+        Write-Host "IP: ${{ steps.get_ip.outputs.ip_address }}"
+        Write-Host "Username: githubadmin"
+        Write-Host "Password: Pass@123"
+        Write-Host "==================`n"
+        while ($true) {
+          Write-Host "[$(Get-Date -Format s)] الجلسة نشطة، ستجدد تلقائيًا بعد انتهاء المدة."
+          Start-Sleep -Seconds 300
+        }
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
-            Write-Error "Tailscale binary not found at $exe"
-            exit 1
-          }
-
-          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale IPv4
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {
-              $tsIP = (& $exe ip -4) -replace "\s+",""
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned."
-              exit 1
-          }
-
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
-        shell: pwsh
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Warning "TCP connection to RDP port 3389 could not be established from runner. This may still be reachable from your client via Tailscale."
-          } else {
-              Write-Host "TCP connectivity successful!"
-          }
-
-      - name: Notify via Telegram
-        shell: pwsh
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          $user = $env:RDP_USER
-          $pass = $env:RDP_PASSWORD
-          $ip   = $env:TAILSCALE_IP
-
-          $message = @"
-🔔 *RDP Session Ready*
-• Address: `"$ip`"
-• Username: `"$user`"
-• Password: `"$pass`"
-
-_This runner will renew automatically every ~6 hours._
-"@
-
-          $body = @{
-            chat_id = $env:TELEGRAM_CHAT_ID
-            text    = $message
-            parse_mode = "Markdown"
-          }
-
-          $url = "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage"
-          try {
-            $resp = Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json" -Body ($body | ConvertTo-Json)
-            Write-Host "Telegram notify sent."
-          } catch {
-            Write-Warning "Failed to send Telegram message: $_"
-          }
-
-      - name: Maintain Connection (Informational loop)
-        shell: pwsh
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "==================`n"
-
-          # Keep job alive until GitHub timeout (or cancellation)
-          while ($true) {
-            Write-Host "[$(Get-Date -Format s)] RDP Active - will renew when workflow ends."
-            Start-Sleep -Seconds 300
-          }
-
-      # IMPORTANT: auto-restart dispatch (will run only when job ends). Use GITHUB_TOKEN to dispatch same workflow.
-      - name: Auto-Restart Workflow
-        if: always()
-        shell: pwsh
-        env:
-          REPO: ${{ github.repository }}
-          WORKFLOW_FILE: rdp.yml   # <-- name of this workflow file in .github/workflows/
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Slight delay to ensure final logs are flushed (optional)
-          Start-Sleep -Seconds 5
-
-          $uri = "https://api.github.com/repos/$env:REPO/actions/workflows/$env:WORKFLOW_FILE/dispatches"
-          $headers = @{
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            Accept = "application/vnd.github+json"
-            "User-Agent" = "gh-actions-autorestart"
-          }
-          $body = @{ ref = "${{ github.ref_name || 'main' }}" }  # attempts to reuse same branch, falls back to main if not set
-          try {
-            Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body ($body | ConvertTo-Json -Depth 4)
-            Write-Host "Dispatched new workflow run."
-          } catch {
-            Write-Warning "Failed to dispatch workflow: $_"
-          }
+    - name: إعادة تشغيل Workflow تلقائيًا
+      if: always()
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        REPO: ${{ github.repository }}
+        WORKFLOW_FILE: rdp.yml
+      run: |
+        Start-Sleep -Seconds 5
+        $uri = "https://api.github.com/repos/$env:REPO/actions/workflows/$env:WORKFLOW_FILE/dispatches"
+        $headers = @{
+          Authorization = "Bearer $env:GH_TOKEN"
+          Accept = "application/vnd.github+json"
+          "User-Agent" = "gh-actions-autorestart"
+        }
+        $body = @{ ref = "${{ github.ref_name || 'main' }}" }
+        try {
+          Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body ($body | ConvertTo-Json -Depth 4)
+          Write-Host "✅ تم إعادة تشغيل Workflow تلقائيًا"
+        } catch {
+          Write-Warning "⚠️ فشل في إعادة تشغيل Workflow: $_"
+        }
